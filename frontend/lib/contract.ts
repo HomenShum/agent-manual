@@ -24,6 +24,7 @@ export interface Part {
 
 /** The heart of the contract — everything the viewer needs to render + explode. */
 export interface ModelResult {
+  kind?: "3d";
   model_id: string;
   source_image_url: string;
   /** Global center; explode radiates from here. */
@@ -40,8 +41,8 @@ export interface Job {
   status: JobStatus;
   /** 0–100, best effort. */
   progress: number;
-  /** Present only when status === "done". */
-  result: ModelResult | null;
+  /** Present only when status === "done". Discriminated by `kind`. */
+  result: ModelResult | TwoDResult | null;
   /** Human-readable string when status === "error", else null. */
   error: string | null;
 }
