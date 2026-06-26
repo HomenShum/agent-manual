@@ -3,6 +3,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ParallaxViewer, PartMeta } from "@/lib/parallax-viewer";
 import TwoDStage from "@/components/two-d-stage";
+import { useSpeech } from "@/lib/use-speech";
+import {
+  startGenerate as apiGenerate,
+  pollJob,
+  askAgent,
+  fileUrl,
+} from "@/lib/api";
+import type { AgentAction } from "@/lib/contract";
 
 /* ---- types ---- */
 type Mode = "3d" | "2d";
@@ -56,6 +64,22 @@ const GEN_STEPS_2D: [number, string][] = [
   [80, "Encoding sequence…"],
 ];
 
+/** Render an agent action as a chip label, e.g. isolate([P-07, P-08]). */
+function fmtAction(a: AgentAction): string {
+  switch (a.type) {
+    case "explode":
+      return `explode(${a.factor})`;
+    case "highlight":
+      return `highlight(${a.part_id})`;
+    case "isolate":
+      return `isolate([${a.part_ids.join(", ")}])`;
+    case "focus":
+      return `focus(${a.part_id})`;
+    case "reset":
+      return "reset()";
+  }
+}
+
 export default function Home() {
   const [mode, setMode] = useState<Mode>("3d");
   const [appState, setAppState] = useState<AppState>("loaded");
@@ -84,6 +108,7 @@ export default function Home() {
   const genAssetRef = useRef<Asset | null>(null);
   const singlePartRef = useRef(false);
   const modeRef = useRef<Mode>("3d");
+  const explodeRef = useRef(0);
 
   useEffect(() => {
     singlePartRef.current = singlePart;
@@ -91,6 +116,9 @@ export default function Home() {
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
+  useEffect(() => {
+    explodeRef.current = explode;
+  }, [explode]);
 
   // One-time client init from URL/env (can't live in a useState initializer
   // without an SSR hydration mismatch). ?tab=2d|3d deep link + optional sample
@@ -153,14 +181,11 @@ export default function Home() {
     if (m) setSelected(m);
   }, []);
 
-  /* ---- scripted agent (mode-aware: acts on the live 3D viewer or the frame scrubber) ---- */
-  const handleUserText = useCallback(
+  /* ---- scripted responder: 2D scrub + 3D offline fallback (real agent in handleUserText) ---- */
+  const runScriptedAgent = useCallback(
     (text: string) => {
-      setMsgs((prev) => prev.concat([{ role: "user", text }]));
-      setDraft("");
       setThinking(true);
       if (thinkTimer.current) clearTimeout(thinkTimer.current);
-
       thinkTimer.current = setTimeout(() => {
         const v = viewerRef.current;
 
@@ -323,11 +348,120 @@ export default function Home() {
     [selectById],
   );
 
+  /* ---- apply a single agent action to the live viewer / frame scrubber ---- */
+  const applyAction = useCallback(
+    (a: AgentAction) => {
+      const v = viewerRef.current;
+      switch (a.type) {
+        case "explode":
+          setExplode(a.factor);
+          if (modeRef.current === "3d") v?.setExplode(a.factor);
+          break;
+        case "highlight":
+          if (modeRef.current === "3d") {
+            v?.clearIsolate();
+            v?.highlight(a.part_id);
+            selectById(a.part_id);
+          }
+          break;
+        case "isolate":
+          if (modeRef.current === "3d") {
+            if (explodeRef.current < 0.3) {
+              setExplode(0.5);
+              v?.setExplode(0.5);
+            }
+            v?.isolate(a.part_ids);
+            if (a.part_ids[0]) selectById(a.part_ids[0]);
+          }
+          break;
+        case "focus":
+          if (modeRef.current === "3d") {
+            v?.clearIsolate();
+            v?.focus(a.part_id);
+            selectById(a.part_id);
+          }
+          break;
+        case "reset":
+          v?.reset();
+          setExplode(0);
+          setSelected(null);
+          break;
+      }
+    },
+    [selectById],
+  );
+
+  /* ---- send a message: real 3.5 Flash for 3D, scripted scrub for 2D ---- */
+  const handleUserText = useCallback(
+    (text: string) => {
+      setMsgs((prev) => prev.concat([{ role: "user", text }]));
+      setDraft("");
+
+      // 2D: the agent scrubs the generated sequence (scripted, tailored copy).
+      if (modeRef.current === "2d") {
+        runScriptedAgent(text);
+        return;
+      }
+
+      // 3D: real agent via /api/agent (3.5 Flash). Scripted fallback if unreachable.
+      setThinking(true);
+      (async () => {
+        try {
+          const res = await askAgent({
+            model_id: modelName || "demo",
+            message: text,
+            explode_factor: explodeRef.current,
+          });
+          res.actions.forEach(applyAction);
+          setThinking(false);
+          setMsgs((prev) =>
+            prev.concat([
+              {
+                role: "agent",
+                text: res.reply || "…",
+                actions: res.actions.map(fmtAction),
+              },
+            ]),
+          );
+        } catch {
+          runScriptedAgent(text); // backend offline → keep the demo alive
+        }
+      })();
+    },
+    [runScriptedAgent, applyAction, modelName],
+  );
+
+  /* ---- voice input: mic → live transcript → composer draft ---- */
+  // Text already committed (typed or finalized) before the current interim chunk.
+  const speechBaseRef = useRef("");
+  const onInterim = useCallback((text: string) => {
+    const base = speechBaseRef.current;
+    setDraft(base ? `${base} ${text}` : text);
+  }, []);
+  const onFinal = useCallback((text: string) => {
+    if (!text) return;
+    const base = speechBaseRef.current;
+    const next = base ? `${base} ${text}` : text;
+    speechBaseRef.current = next;
+    setDraft(next);
+  }, []);
+  const speech = useSpeech({ onInterim, onFinal });
+  const { listening: micOn, stop: stopMic } = speech;
+
+  const toggleMic = useCallback(() => {
+    if (appState !== "loaded") return;
+    // Starting a fresh dictation session: anchor to whatever is in the box now.
+    if (!micOn) speechBaseRef.current = draft.trim();
+    speech.toggle();
+  }, [appState, draft, micOn, speech]);
+
   const send = useCallback(() => {
     const t = draft.trim();
     if (!t || appState !== "loaded") return;
+    stopMic();
+    speechBaseRef.current = "";
     handleUserText(t);
-  }, [draft, appState, handleUserText]);
+  }, [draft, appState, handleUserText, stopMic]);
 
   const onKey = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -478,11 +612,60 @@ export default function Home() {
     setAppState("empty");
     setDrawerOpen(false);
   }, []);
+  /* ---- real 2D pipeline: upload → /api/generate (mode=2d) → poll → play Kling video ---- */
+  const runGenerate2D = useCallback(async (file: File) => {
+    if (genTimer.current) clearInterval(genTimer.current);
+    setAppState("generating");
+    setProgress(0);
+    setGenStep("Uploading photo…");
+    setErrAssetName(file.name);
+    try {
+      const job = await apiGenerate(file, "2d");
+      const final = await pollJob(job.job_id, (j) => {
+        const p = j.progress ?? 0;
+        setProgress(p);
+        setGenStep(
+          p < 45
+            ? "Generating part image…"
+            : p < 95
+              ? "Synthesizing exploded frames…"
+              : "Encoding sequence…",
+        );
+      });
+      if (final.status === "error" || !final.result || final.result.kind !== "2d") {
+        setErrAssetName(file.name);
+        setAppState("error");
+        return;
+      }
+      const r = final.result;
+      setTwoDVideoSrc(fileUrl(r.video_url));
+      setModelName(file.name.replace(/\.[^.]+$/, ""));
+      setActiveAssetId("");
+      setSinglePart(false);
+      setExplode(0);
+      setSelected(null);
+      setAppState("loaded");
+      setMsgs([
+        {
+          role: "agent",
+          text: `Generated an exploded-view clip from ${file.name}. Drag the FRAME slider — 0% assembled, 100% exploded.`,
+          actions: [`kling · ${r.frame_count ?? FRAMES_2D} frames`],
+        },
+      ]);
+    } catch {
+      setErrAssetName(file.name);
+      setAppState("error");
+    }
+  }, []);
+
   const onFile = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
-      if (e.target.files && e.target.files[0]) startGenerate(ASSETS[0]);
+      const file = e.target.files?.[0];
+      if (!file) return;
+      if (modeRef.current === "2d") runGenerate2D(file);
+      else startGenerate(ASSETS[0]); // 3D backend is a stub → keep the simulation
     },
-    [startGenerate],
+    [runGenerate2D, startGenerate],
   );
   const useSample = useCallback(() => startGenerate(ASSETS[0]), [startGenerate]);
   const selectAsset = useCallback(
@@ -664,6 +847,30 @@ export default function Home() {
                     : "Ask about a part, or tell me to isolate / focus / explode…"
                 }
               />
+              {speech.supported && (
+                <button
+                  className={`pl-mic${micOn ? " on" : ""}`}
+                  onClick={toggleMic}
+                  disabled={appState !== "loaded"}
+                  aria-label={micOn ? "Stop dictation" : "Start dictation"}
+                  aria-pressed={micOn}
+                  title={micOn ? "Listening… click to stop" : "Dictate"}
+                >
+                  <svg
+                    width="16"
+                    height="16"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2.2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
+                    <path d="M19 10v1a7 7 0 0 1-14 0v-1M12 18v4" />
+                  </svg>
+                </button>
+              )}
               <button className="pl-send" onClick={send} aria-label="Send">
                 <svg
                   width="16"
