@@ -1,0 +1,71 @@
+/**
+ * Shared types for the frontend <-> backend seam.
+ * Source of truth: CONTRACT.md (jointly owned — do not change unilaterally).
+ */
+
+export type Vec3 = [number, number, number];
+
+export interface BBox {
+  min: Vec3;
+  max: Vec3;
+}
+
+/** One separated part of the model, positioned in PartCrafter's global canonical frame. */
+export interface Part {
+  part_id: string;
+  /** Human label, e.g. "housing". Falls back to "part_0" when PartCrafter gives no name. */
+  label: string;
+  /** GLB served by the backend under /files/... */
+  model_url: string;
+  /** Part center in the same canonical frame. Used (with `center`) to compute explode. */
+  centroid: Vec3;
+  bbox: BBox;
+}
+
+/** The heart of the contract — everything the viewer needs to render + explode. */
+export interface ModelResult {
+  model_id: string;
+  source_image_url: string;
+  /** Global center; explode radiates from here. */
+  center: Vec3;
+  bbox: BBox;
+  /** One entry per part, arbitrary count. Length 1 = fused-mesh fallback. */
+  parts: Part[];
+}
+
+export type JobStatus = "queued" | "running" | "done" | "error";
+
+export interface Job {
+  job_id: string;
+  status: JobStatus;
+  /** 0–100, best effort. */
+  progress: number;
+  /** Present only when status === "done". */
+  result: ModelResult | null;
+  /** Human-readable string when status === "error", else null. */
+  error: string | null;
+}
+
+/* ----- Agent action protocol (frozen — both sides implement exactly these) ----- */
+
+export type AgentAction =
+  | { type: "explode"; factor: number } // set explode slider to factor (0–1)
+  | { type: "highlight"; part_id: string } // emphasize one part
+  | { type: "isolate"; part_ids: string[] } // show only these parts
+  | { type: "focus"; part_id: string } // move camera to frame this part
+  | { type: "reset" }; // assembled, all visible, camera home
+
+export type AgentActionType = AgentAction["type"];
+
+export interface AgentRequest {
+  model_id: string;
+  message: string;
+  /** Current viewer state so the agent has context. */
+  explode_factor: number;
+}
+
+export interface AgentResponse {
+  reply: string;
+  /** Frontend executes these in order. */
+  actions: AgentAction[];
+}

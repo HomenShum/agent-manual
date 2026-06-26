@@ -1,0 +1,25 @@
+# Node / Next.js
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+
+# Python / FastAPI
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Backend-generated binaries (input images, part GLBs)
+backend/files/
+
+# Env
+.env
+.env.local
+.env*.local
+
+# Misc
+.DS_Store
+*.log
+.vercel
