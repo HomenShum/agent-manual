@@ -11,10 +11,21 @@ export interface BBox {
 }
 
 /** One separated part of the model, positioned in PartCrafter's global canonical frame. */
+export interface PartSource {
+  url: string;
+  title: string;
+}
+
 export interface Part {
   part_id: string;
   /** Human label, e.g. "housing". Falls back to "part_0" when PartCrafter gives no name. */
   label: string;
+  description?: string;
+  confidence?: number;
+  source_status?: string;
+  sources?: PartSource[];
+  visual_evidence?: string;
+  unknowns?: string[];
   /** GLB served by the backend under /files/... */
   model_url: string;
   /** Part center in the same canonical frame. Used (with `center`) to compute explode. */
@@ -22,15 +33,56 @@ export interface Part {
   bbox: BBox;
 }
 
+export interface Citation {
+  claim_id?: string;
+  source_type?: string;
+  url: string;
+  title: string;
+  used_for?: string;
+  snippet?: string;
+}
+
+export interface ManualStep {
+  step?: number;
+  title?: string;
+  description?: string;
+  [key: string]: unknown;
+}
+
+export interface SnapliiAction {
+  id: string;
+  type: "manual_card" | "parts_action" | "reward_claim";
+  status: string;
+  label: string;
+  url: string;
+  job_id: string;
+  created_at: number;
+  requires_user_approval: boolean;
+  mock?: boolean;
+  metadata?: Record<string, unknown>;
+}
+
 /** The heart of the contract — everything the viewer needs to render + explode. */
 export interface ModelResult {
   model_id: string;
   source_image_url: string;
+  manual_url?: string;
   /** Global center; explode radiates from here. */
   center: Vec3;
   bbox: BBox;
   /** One entry per part, arbitrary count. Length 1 = fused-mesh fallback. */
   parts: Part[];
+  object_type?: string;
+  likely_model?: string;
+  object_summary?: string;
+  object_confidence?: number;
+  citations?: Citation[];
+  steps?: ManualStep[];
+  warnings?: string[];
+  non_claims?: string[];
+  explode_frames?: string[];
+  turntable_frames?: string[];
+  snaplii_actions?: SnapliiAction[];
 }
 
 export type JobStatus = "queued" | "running" | "done" | "error";
@@ -68,4 +120,6 @@ export interface AgentResponse {
   reply: string;
   /** Frontend executes these in order. */
   actions: AgentAction[];
+  /** Citations from Google Search grounding. */
+  citations?: Citation[];
 }

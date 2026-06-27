@@ -2,7 +2,7 @@
  * Thin client for the backend API (see CONTRACT.md).
  * Base URL comes from NEXT_PUBLIC_API_BASE (the AgentBox URL).
  */
-import type { AgentRequest, AgentResponse, Job } from "./contract";
+import type { AgentRequest, AgentResponse, Job, SnapliiAction } from "./contract";
 
 export const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
@@ -11,7 +11,7 @@ function url(path: string): string {
   return `${API_BASE}${path}`;
 }
 
-/** Resolve a (possibly relative) /files URL against the backend base. */
+/** Resolve a (possibly relative) backend URL against the backend base. */
 export function fileUrl(modelUrl: string): string {
   if (/^https?:\/\//.test(modelUrl)) return modelUrl;
   return url(modelUrl);
@@ -58,5 +58,29 @@ export async function askAgent(req: AgentRequest): Promise<AgentResponse> {
     body: JSON.stringify(req),
   });
   if (!res.ok) throw new Error(`agent failed: ${res.status}`);
+  return res.json();
+}
+
+/** Create a Snaplii action card for a completed manual. */
+export async function createSnapliiAction(
+  jobId: string,
+  actionType: "manual_card" | "parts_action" | "reward_claim",
+  label?: string,
+): Promise<SnapliiAction> {
+  const res = await fetch(url(`/v1/manuals/${jobId}/snaplii/actions`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action_type: actionType, label }),
+  });
+  if (!res.ok) throw new Error(`snaplii action failed: ${res.status}`);
+  return res.json();
+}
+
+/** Get a specific Snaplii action by ID. */
+export async function getSnapliiAction(jobId: string, actionId: string): Promise<SnapliiAction> {
+  const res = await fetch(url(`/v1/manuals/${jobId}/snaplii/actions/${actionId}`), {
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`snaplii get failed: ${res.status}`);
   return res.json();
 }
