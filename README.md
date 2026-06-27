@@ -44,7 +44,7 @@ sequenceDiagram
     BE->>BE: Extract frames (ffmpeg)
     BE->>BE: Build HTML/PDF manual
     BE-->>FE: Job complete (polling)
-    FE->>U: 3D depth-displaced viewer + agent sidebar
+    FE->>U: 3D viewer + agent sidebar
 ```
 
 ### Pipeline Architecture
@@ -115,7 +115,7 @@ parallax-snaplii/
 │   ├── components/
 │   │   └── two-d-stage.tsx     # 2D video frame-scrub viewer
 │   ├── lib/
-│   │   ├── parallax-viewer.ts  # Three.js 3D viewer (depth-displaced mesh)
+│   │   ├── parallax-viewer.ts  # Three.js 3D viewer (textured plane + frame scrubbing)
 │   │   ├── api.ts              # Backend API client
 │   │   ├── contract.ts         # Shared types
 │   │   ├── explode.ts          # Explode animation utilities
@@ -178,7 +178,7 @@ Open [http://localhost:3000](http://localhost:3000)
 
 | Mode | Description | Output |
 |------|-------------|--------|
-| **3D** | Three.js depth-displaced mesh with orbit/zoom, floating part labels, luminance-based depth maps | WebGL canvas, part selection, explode slider |
+| **3D** | Three.js textured plane with orbit/zoom, floating 3D part labels, Kling V3 Omni video frame scrubbing | WebGL canvas, part selection, explode slider |
 | **2D** | Kling V3 Omni video frame-scrub with auto-play loop | HTML5 video, frame slider, 24 extracted frames |
 
 ---
@@ -223,7 +223,7 @@ Open [http://localhost:3000](http://localhost:3000)
 | **VLM** | Gemini 3.5 Flash (via GMI Cloud) — object analysis, video understanding |
 | **Video Gen** | Kling V3 Omni (via GMI Cloud) — 1080p pro mode, 3D Spacetime physics |
 | **Frontend** | Next.js 15, React, TypeScript |
-| **3D Viewer** | Three.js — depth-displaced mesh, luminance depth maps, orbit controls |
+| **3D Viewer** | Three.js — textured plane, frame scrubbing, orbit controls, floating part labels |
 | **Frame Extraction** | ffmpeg |
 | **Search** | Gemini grounded search (concurrent fanout) |
 

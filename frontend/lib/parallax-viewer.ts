@@ -28,10 +28,7 @@ interface PartLabel {
 interface FrameSeqState {
   textures: THREE.Texture[];
   mesh: THREE.Mesh;
-  mat: THREE.MeshStandardMaterial;
-  baseGeometry: THREE.BufferGeometry;
-  depthData: Float32Array | null;
-  depthCache: Map<THREE.Texture, Float32Array>;
+  mat: THREE.MeshBasicMaterial;
   count: number;
   loaded: boolean;
   partLabels: PartLabel[];
@@ -441,12 +438,10 @@ export class ParallaxViewer {
       ? [sourceImageUrl, ...frameUrls]
       : frameUrls;
 
-    // Build or reuse the displaced mesh
+    // Build or reuse the textured plane
     if (!this.frameSeq) {
-      const geo = new THREE.PlaneGeometry(12, 12, 128, 128);
-      const mat = new THREE.MeshStandardMaterial({
-        roughness: 0.65,
-        metalness: 0.15,
+      const geo = new THREE.PlaneGeometry(12, 12);
+      const mat = new THREE.MeshBasicMaterial({
         side: THREE.DoubleSide,
         transparent: true,
         opacity: 1,
@@ -458,9 +453,6 @@ export class ParallaxViewer {
         textures: [],
         mesh,
         mat,
-        baseGeometry: geo.clone(),
-        depthData: null,
-        depthCache: new Map(),
         count: 0,
         loaded: false,
         partLabels: [],
@@ -489,13 +481,10 @@ export class ParallaxViewer {
             const img = tex.image as HTMLImageElement;
             const aspect = img.width / img.height || 1;
             fs.mesh.geometry.dispose();
-            const newGeo = new THREE.PlaneGeometry(12 * aspect, 12, 128, 128);
+            const newGeo = new THREE.PlaneGeometry(12 * aspect, 12);
             fs.mesh.geometry = newGeo;
-            fs.baseGeometry = newGeo.clone();
             fs.mat.map = tex;
             fs.mat.needsUpdate = true;
-            fs.depthData = this._estimateDepth(tex);
-            this._applyDepth(0);
           }
         } catch {
           // skip failed frames
@@ -594,81 +583,6 @@ export class ParallaxViewer {
     });
   }
 
-  /**
-   * Estimate a depth map from texture luminance. Uses caching to avoid
-   * recomputing for the same texture. Brighter pixels = closer (positive Z),
-   * darker = farther. Center bias makes the subject pop forward.
-   */
-  private _estimateDepth(tex: THREE.Texture): Float32Array {
-    if (!this.frameSeq) return new Float32Array(0);
-    const cached = this.frameSeq.depthCache.get(tex);
-    if (cached) return cached;
-
-    const img = tex.image as HTMLImageElement;
-    const w = 128;
-    const h = 128;
-    const canvas = document.createElement("canvas");
-    canvas.width = w;
-    canvas.height = h;
-    const ctx = canvas.getContext("2d")!;
-    ctx.drawImage(img, 0, 0, w, h);
-    const pixels = ctx.getImageData(0, 0, w, h).data;
-
-    const depth = new Float32Array(w * h);
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        const i = (y * w + x) * 4;
-        const lum =
-          (0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2]) /
-          255;
-        const cx = (x - w / 2) / (w / 2);
-        const cy = (y - h / 2) / (h / 2);
-        const centerDist = Math.sqrt(cx * cx + cy * cy);
-        const centerBias = Math.max(0, 1 - centerDist * 0.7);
-        // Edge detection: larger luminance gradient = more depth
-        const gx = x > 0 && x < w - 1
-          ? Math.abs(pixels[(y * w + x + 1) * 4] - pixels[(y * w + x - 1) * 4]) / 255
-          : 0;
-        const gy = y > 0 && y < h - 1
-          ? Math.abs(pixels[((y + 1) * w + x) * 4] - pixels[((y - 1) * w + x) * 4]) / 255
-          : 0;
-        const edge = Math.min(1, (gx + gy) * 2);
-        depth[y * w + x] = lum * 0.35 + centerBias * 0.45 + edge * 0.2;
-      }
-    }
-    this.frameSeq.depthCache.set(tex, depth);
-    return depth;
-  }
-
-  /**
-   * Apply depth displacement to the mesh vertices.
-   * @param explode 0 = flat, 1 = fully displaced (parts lifted in Z)
-   */
-  private _applyDepth(explode: number): void {
-    if (!this.frameSeq || !this.frameSeq.depthData) return;
-    const geo = this.frameSeq.mesh.geometry as THREE.BufferGeometry;
-    const base = this.frameSeq.baseGeometry;
-    const positions = geo.attributes.position as THREE.BufferAttribute;
-    const basePos = base.attributes.position as THREE.BufferAttribute;
-    const depth = this.frameSeq.depthData;
-    const w = 128;
-    const h = 128;
-    const maxDepth = 3.5; // max Z displacement in world units
-
-    for (let i = 0; i < positions.count; i++) {
-      // Map vertex index to depth grid
-      const ix = i % (w + 1);
-      const iy = Math.floor(i / (w + 1));
-      const dx = Math.min(Math.floor((ix / (w + 1)) * w), w - 1);
-      const dy = Math.min(Math.floor((iy / (h + 1)) * h), h - 1);
-      const d = depth[dy * w + dx] || 0;
-      const z = (d - 0.5) * maxDepth * explode;
-      positions.setZ(i, basePos.getZ(i) + z);
-    }
-    positions.needsUpdate = true;
-    geo.computeVertexNormals();
-  }
-
   /** True when real generated frames are active (no procedural geometry). */
   hasFrameSequence(): boolean {
     return !!(this.frameSeq && this.frameSeq.loaded);
@@ -686,8 +600,6 @@ export class ParallaxViewer {
     });
     this.frameSeq.mat.dispose();
     this.frameSeq.mesh.geometry.dispose();
-    this.frameSeq.baseGeometry.dispose();
-    this.frameSeq.depthCache.clear();
     this.frameSeq = null;
     this.parts.forEach((p) => (p.visible = true));
   }
@@ -914,7 +826,7 @@ export class ParallaxViewer {
       });
     }
 
-    // Update frame sequence: scrub explode frames + depth displacement + labels
+    // Update frame sequence: scrub explode frames + labels
     if (this.frameSeq && this.frameSeq.loaded) {
       const fs = this.frameSeq;
 
@@ -928,12 +840,8 @@ export class ParallaxViewer {
         if (tex && fs.mat.map !== tex) {
           fs.mat.map = tex;
           fs.mat.needsUpdate = true;
-          fs.depthData = this._estimateDepth(tex);
         }
       }
-
-      // Apply depth displacement (always update for smooth animation)
-      this._applyDepth(this.explode);
 
       // Animate part labels: fade in and move outward as explode increases
       const labelOpacity = Math.min(1, Math.max(0, (this.explode - 0.15) / 0.25));
