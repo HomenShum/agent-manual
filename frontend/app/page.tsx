@@ -3,20 +3,41 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ParallaxViewer, PartMeta } from "@/lib/parallax-viewer";
 import TwoDStage from "@/components/two-d-stage";
-import { startGenerate, pollJob, askAgent, createSnapliiAction, getSnapliiAction, fileUrl, API_BASE } from "@/lib/api";
-import type { Job, ModelResult, Part, Citation, SnapliiAction } from "@/lib/contract";
+import { useSpeech } from "@/lib/use-speech";
+import {
+  startGenerate as apiGenerate,
+  pollJob,
+  askAgent,
+  fileUrl,
+} from "@/lib/api";
+import type { AgentAction } from "@/lib/contract";
 
 /* ---- types ---- */
-type Mode = "3d" | "2d" | "manual";
+type Mode = "3d" | "2d";
 type AppState = "loaded" | "empty" | "generating" | "error";
+type AssetType = "multi" | "single" | "error";
 type Selected = Pick<PartMeta, "id" | "name" | "note">;
 
 interface Msg {
   role: "agent" | "user";
   text: string;
   actions?: string[];
-  citations?: Citation[];
 }
+
+interface Asset {
+  id: string;
+  name: string;
+  type: AssetType;
+  tag: string;
+}
+
+const ASSETS: Asset[] = [
+  { id: "ASSET-01", name: "Single-Cylinder Assembly", type: "multi", tag: "8 PARTS" },
+  { id: "ASSET-02", name: "Brake Caliper Body", type: "single", tag: "1 PART" },
+  { id: "ASSET-03", name: "Coolant Pump Housing", type: "error", tag: "FAILED" },
+  { id: "ASSET-04", name: "Turbo Center Section", type: "multi", tag: "8 PARTS" },
+  { id: "ASSET-05", name: "Gear Reduction Set", type: "multi", tag: "8 PARTS" },
+];
 
 const ACCENT = "#3ad8ff";
 const FRAMES_2D = 48;
@@ -24,19 +45,63 @@ const FRAMES_2D = 48;
 const INTRO: Msg = {
   role: "agent",
   text:
-    "Upload a product photo and I'll analyze it with Gemini vision + Google Search grounding. I'll identify parts, generate a visual manual, and answer your questions about the object.",
-  actions: ["ready - awaiting upload"],
+    "Model ready — Single-Cylinder Assembly. I resolved 8 separable parts from your photo. Pick a part on the stage, drag the explode slider, or ask me to isolate, focus, or flag wear surfaces.",
+  actions: ["reconstruct() · 8 parts"],
 };
 
-const GEN_STEPS: [number, string][] = [
-  [0, "Uploading image..."],
-  [10, "Analyzing with Gemini Vision..."],
-  [30, "Searching with Google Search grounding..."],
-  [50, "Planning parts & structure..."],
-  [70, "Generating visual overlays..."],
-  [85, "Building manual.json..."],
-  [95, "Rendering artifacts..."],
+const GEN_STEPS_3D: [number, string][] = [
+  [0, "Segmenting source image…"],
+  [22, "Estimating depth & silhouette…"],
+  [44, "Reconstructing part geometry…"],
+  [66, "Resolving part boundaries…"],
+  [84, "Assigning material & axes…"],
 ];
+
+const GEN_STEPS_2D: [number, string][] = [
+  [0, "Uploading photo…"],
+  [10, "Analyzing object with Gemini…"],
+  [25, "Identifying parts & components…"],
+  [40, "Researching technical context…"],
+  [55, "Generating Kling explode video…"],
+  [75, "Extracting frames from video…"],
+  [85, "Building visual manual…"],
+  [95, "Rendering PDF…"],
+];
+
+// Claude Code-style rotating spinner verbs — cycled every ~2.5s while generating
+const SPINNER_VERBS = [
+  "Thinking",
+  "Analyzing",
+  "Identifying",
+  "Researching",
+  "Synthesizing",
+  "Orchestrating",
+  "Generating",
+  "Rendering",
+  "Extracting",
+  "Computing",
+  "Crafting",
+  "Processing",
+  "Percolating",
+  "Cogitating",
+  "Contemplating",
+  "Pondering",
+  "Ruminating",
+  "Inferring",
+  "Concocting",
+  "Churning",
+  "Hashing",
+  "Crunching",
+  "Simmering",
+  "Brewing",
+  "Distilling",
+];
+
+// Spinner icon frames (Claude Code-style Unicode animation)
+const SPINNER_FRAMES = ["·", "✢", "✳", "✶", "✻", "✽"];
+const SPINNER_INTERVAL = 120; // ms per frame
+const VERB_INTERVAL = 2500; // ms per verb rotation
+const SIM_TICK = 80; // ms per simulated progress tick
 
 /** Render an agent action as a chip label, e.g. isolate([P-07, P-08]). */
 function fmtAction(a: AgentAction): string {
@@ -56,39 +121,48 @@ function fmtAction(a: AgentAction): string {
 
 export default function Home() {
   const [mode, setMode] = useState<Mode>("3d");
-  const [appState, setAppState] = useState<AppState>("empty");
-  const [modelName, setModelName] = useState("No model loaded");
+  const [appState, setAppState] = useState<AppState>("loaded");
+  const [modelName, setModelName] = useState("Single-Cylinder Assembly");
   const [explode, setExplode] = useState(0);
   const [singlePart, setSinglePart] = useState(false);
-  const [partCount, setPartCount] = useState(0);
+  const [partCount, setPartCount] = useState(8);
   const [draft, setDraft] = useState("");
   const [thinking, setThinking] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const [progress, setProgress] = useState(0);
   const [genStep, setGenStep] = useState("");
+  const [spinnerChar, setSpinnerChar] = useState(SPINNER_FRAMES[0]);
+  const [spinnerVerb, setSpinnerVerb] = useState(SPINNER_VERBS[0]);
+  const [activeAssetId, setActiveAssetId] = useState("ASSET-01");
   const [errAssetName, setErrAssetName] = useState("");
   const [selected, setSelected] = useState<Selected | null>(null);
   const [msgs, setMsgs] = useState<Msg[]>([INTRO]);
-  const [currentJobId, setCurrentJobId] = useState<string | null>(null);
-  const [currentModelId, setCurrentModelId] = useState<string | null>(null);
-
-  // Enriched data from backend
-  const [sourceImageUrl, setSourceImageUrl] = useState<string>("");
-  const [manualUrl, setManualUrl] = useState<string>("");
-  const [allParts, setAllParts] = useState<Part[]>([]);
-  const [allCitations, setAllCitations] = useState<Citation[]>([]);
-  const [objectSummary, setObjectSummary] = useState<string>("");
-  const [objectType, setObjectType] = useState<string>("");
-  const [likelyModel, setLikelyModel] = useState<string>("");
-  const [explodeFrames, setExplodeFrames] = useState<string[]>([]);
-  const [turntableFrames, setTurntableFrames] = useState<string[]>([]);
-  const [warnings, setWarnings] = useState<string[]>([]);
-  const [showPartsPanel, setShowPartsPanel] = useState(false);
-  const [snapliiActions, setSnapliiActions] = useState<SnapliiAction[]>([]);
+  // Real exploded-view video (Kling V3 output) for the 2D tab. null → canvas placeholder.
+  const [twoDVideoSrc, setTwoDVideoSrc] = useState<string | null>(null);
+  const [twoDFrames, setTwoDFrames] = useState<string[] | null>(null);
+  const [twoDSourceImage, setTwoDSourceImage] = useState<string | null>(null);
+  const [manualUrl, setManualUrl] = useState<string | null>(null);
+  const [pdfUrl, setPdfUrl] = useState<string | null>(null);
+  const [autoPlaying, setAutoPlaying] = useState(false);
 
   const viewerRef = useRef<ParallaxViewer | null>(null);
   const stageElRef = useRef<HTMLDivElement | null>(null);
   const logElRef = useRef<HTMLDivElement | null>(null);
+  const genTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const thinkTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const progAccum = useRef(0);
+  const spinnerTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const verbTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const simTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const realProgress = useRef(0);
+  const simProgress = useRef(0);
+  const verbIdx = useRef(0);
+  const frameIdx = useRef(0);
+  const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoRaf = useRef<number>(0);
+  const autoStart = useRef<number>(0);
+  const userInteracting = useRef(false);
+  const genAssetRef = useRef<Asset | null>(null);
   const singlePartRef = useRef(false);
   const modeRef = useRef<Mode>("3d");
   const explodeRef = useRef(0);
@@ -103,10 +177,139 @@ export default function Home() {
     explodeRef.current = explode;
   }, [explode]);
 
+  // One-time client init from URL/env (can't live in a useState initializer
+  // without an SSR hydration mismatch). ?tab=2d|3d deep link + optional sample
+  // exploded-view clip (NEXT_PUBLIC_SAMPLE_2D_VIDEO) to exercise the video path.
   useEffect(() => {
     const t = new URLSearchParams(window.location.search).get("tab");
-    if (t === "2d" || t === "3d" || t === "manual") setMode(t);
+    const sample = process.env.NEXT_PUBLIC_SAMPLE_2D_VIDEO;
+    /* eslint-disable react-hooks/set-state-in-effect -- intentional one-time client init */
+    if (t === "2d" || t === "3d") setMode(t);
+    if (sample) setTwoDVideoSrc(sample);
+    /* eslint-enable react-hooks/set-state-in-effect */
   }, []);
+
+  /* ---- Claude Code-style animated spinner + simulated progress ---- */
+  const startSpinner = useCallback(() => {
+    // Stop any existing timers
+    if (spinnerTimer.current) clearInterval(spinnerTimer.current);
+    if (verbTimer.current) clearInterval(verbTimer.current);
+    if (simTimer.current) clearInterval(simTimer.current);
+
+    frameIdx.current = 0;
+    verbIdx.current = Math.floor(Math.random() * SPINNER_VERBS.length);
+    simProgress.current = 0;
+    realProgress.current = 0;
+
+    setSpinnerChar(SPINNER_FRAMES[0]);
+    setSpinnerVerb(SPINNER_VERBS[verbIdx.current]);
+
+    // Rotate spinner icon frames (~120ms)
+    spinnerTimer.current = setInterval(() => {
+      frameIdx.current = (frameIdx.current + 1) % SPINNER_FRAMES.length;
+      setSpinnerChar(SPINNER_FRAMES[frameIdx.current]);
+    }, SPINNER_INTERVAL);
+
+    // Rotate verbs (~2.5s)
+    verbTimer.current = setInterval(() => {
+      verbIdx.current = (verbIdx.current + 1) % SPINNER_VERBS.length;
+      setSpinnerVerb(SPINNER_VERBS[verbIdx.current]);
+    }, VERB_INTERVAL);
+
+    // Simulated progress: creep forward with easing, never reaching 95% on its own
+    simTimer.current = setInterval(() => {
+      // Ease off as we approach the cap so it feels organic
+      const cap = 92;
+      const remaining = cap - simProgress.current;
+      if (remaining > 0.5) {
+        // Faster early, slower later — proportional to remaining distance
+        const delta = Math.max(0.15, remaining * 0.012 + Math.random() * 0.4);
+        simProgress.current = Math.min(cap, simProgress.current + delta);
+      }
+      // Display the max of simulated and real progress
+      const display = Math.max(simProgress.current, realProgress.current);
+      setProgress(display);
+
+      // Update gen step label based on display progress
+      const steps = modeRef.current === "2d" ? GEN_STEPS_2D : GEN_STEPS_3D;
+      let step = steps[0][1];
+      for (const [threshold, label] of steps) {
+        if (display >= threshold) step = label;
+      }
+      setGenStep(step);
+    }, SIM_TICK);
+  }, []);
+
+  const stopSpinner = useCallback(() => {
+    if (spinnerTimer.current) { clearInterval(spinnerTimer.current); spinnerTimer.current = null; }
+    if (verbTimer.current) { clearInterval(verbTimer.current); verbTimer.current = null; }
+    if (simTimer.current) { clearInterval(simTimer.current); simTimer.current = null; }
+  }, []);
+
+  useEffect(() => () => stopSpinner(), [stopSpinner]);
+
+  /* ---- idle auto-slide: gently oscillate the 2D slider when user is idle ---- */
+  const stopAutoPlay = useCallback(() => {
+    if (autoRaf.current) { cancelAnimationFrame(autoRaf.current); autoRaf.current = 0; }
+    setAutoPlaying(false);
+  }, []);
+
+  const startAutoPlay = useCallback(() => {
+    if (autoRaf.current) return; // already running
+    setAutoPlaying(true);
+    autoStart.current = performance.now();
+    const animate = (now: number) => {
+      const elapsed = (now - autoStart.current) / 1000; // seconds
+      // 6-second period: 3s out, 3s back — gentle and meditative
+      const phase = (elapsed % 6) / 6; // 0→1
+      // sine wave: 0 at phase 0, 1 at phase 0.5, 0 at phase 1
+      const factor = 0.5 - 0.5 * Math.cos(phase * Math.PI * 2);
+      // ease the very start so it doesn't jump
+      const eased = elapsed < 0.8 ? factor * (elapsed / 0.8) : factor;
+      setExplode(eased);
+      autoRaf.current = requestAnimationFrame(animate);
+    };
+    autoRaf.current = requestAnimationFrame(animate);
+  }, []);
+
+  const appStateRef = useRef<AppState>("loaded");
+  useEffect(() => { appStateRef.current = appState; }, [appState]);
+
+  // Reset idle timer whenever user interacts
+  const resetIdle = useCallback(() => {
+    userInteracting.current = true;
+    stopAutoPlay();
+    if (idleTimer.current) clearTimeout(idleTimer.current);
+    idleTimer.current = setTimeout(() => {
+      userInteracting.current = false;
+      // Only auto-play in 2D mode when loaded
+      if (modeRef.current === "2d" && appStateRef.current === "loaded") {
+        startAutoPlay();
+      }
+    }, 3000);
+  }, [stopAutoPlay, startAutoPlay]);
+
+  // Start/stop auto-play when mode or appState changes
+  useEffect(() => {
+    if (mode !== "2d" || appState !== "loaded") {
+      stopAutoPlay();
+      if (idleTimer.current) clearTimeout(idleTimer.current);
+    } else {
+      // Entering 2D loaded state — start idle timer
+      if (idleTimer.current) clearTimeout(idleTimer.current);
+      idleTimer.current = setTimeout(() => {
+        if (modeRef.current === "2d" && appState === "loaded") {
+          startAutoPlay();
+        }
+      }, 3000);
+    }
+    return () => {
+      stopAutoPlay();
+      if (idleTimer.current) clearTimeout(idleTimer.current);
+    };
+  }, [mode, appState, stopAutoPlay, startAutoPlay]);
+
+  useEffect(() => () => { stopAutoPlay(); if (idleTimer.current) clearTimeout(idleTimer.current); }, [stopAutoPlay]);
 
   /* ---- 3D viewer lifecycle (kept mounted across tabs) ---- */
   useEffect(() => {
@@ -119,7 +322,7 @@ export default function Home() {
       if (disposed || !stageElRef.current) return;
       viewer = new VC(stageElRef.current, {
         accent: ACCENT,
-        onPick: (meta: PartMeta | null) => { if (meta) setSelected(meta); },
+        onPick: (meta) => setSelected(meta),
       });
       viewer.setAutoOrbit(false);
       viewerRef.current = viewer;
@@ -135,6 +338,7 @@ export default function Home() {
       disposed = true;
       if (selectTimer) clearTimeout(selectTimer);
       viewer?.dispose();
+      viewerRef.current = null;
     };
   }, []);
 
@@ -144,6 +348,7 @@ export default function Home() {
 
   useEffect(() => {
     return () => {
+      if (genTimer.current) clearInterval(genTimer.current);
       if (thinkTimer.current) clearTimeout(thinkTimer.current);
     };
   }, []);
@@ -155,84 +360,179 @@ export default function Home() {
     if (m) setSelected(m);
   }, []);
 
-  /* ---- real agent: calls backend /api/agent (Gemini-powered) ---- */
-  const handleUserText = useCallback(
-    async (text: string) => {
-      setMsgs((prev: Msg[]) => prev.concat([{ role: "user", text }]));
-      setDraft("");
+  /* ---- scripted responder: 2D scrub + 3D offline fallback (real agent in handleUserText) ---- */
+  const runScriptedAgent = useCallback(
+    (text: string) => {
       setThinking(true);
       if (thinkTimer.current) clearTimeout(thinkTimer.current);
+      thinkTimer.current = setTimeout(() => {
+        const v = viewerRef.current;
 
-      try {
-        if (!currentModelId) {
+        // ----- 2D frame-scrub mode -----
+        if (modeRef.current === "2d") {
+          const twoD: { match: RegExp; actions: string[]; text: string; run: () => void }[] = [
+            {
+              match: /(come?s? apart|explode|disassemb|take apart|separate|blow.?up|run.*apart|exploded)/i,
+              actions: ["scrub(1.0)"],
+              text:
+                "Scrubbing to the fully exploded frame — the parts fan out along the assembly axis. Each frame between here and 0% is a generated in-between.",
+              run: () => setExplode(1),
+            },
+            {
+              match: /(reset|reassemble|assemble|put.*back|default|collapse|back to)/i,
+              actions: ["scrub(0.0)"],
+              text: "Back to the assembled frame.",
+              run: () => setExplode(0),
+            },
+            {
+              match: /(manual|guide|instructions?|how.*use|read.*manual|view.*manual|open.*manual)/i,
+              actions: ["open_manual()"],
+              text: manualUrl
+                ? "Opening the visual manual in a new tab — it has the full part breakdown, assembly steps, and safety notes."
+                : "No manual has been generated yet. Upload a product photo to generate one.",
+              run: () => { if (manualUrl) window.open(manualUrl, "_blank"); },
+            },
+            {
+              match: /(explain|sequence|how|parts|what|pipeline)/i,
+              actions: [],
+              text:
+                "This view is a generated exploded sequence: an image model produces the part and its multi-angle shots, then a second model synthesizes the frames between assembled and exploded. The slider scrubs that sequence — 0% assembled, 100% exploded.",
+              run: () => {},
+            },
+          ];
+          const intent = twoD.find((i) => i.match.test(text));
+          if (intent) {
+            intent.run();
+            setThinking(false);
+            setMsgs((prev) =>
+              prev.concat([{ role: "agent", text: intent.text, actions: intent.actions }]),
+            );
+          } else {
+            setThinking(false);
+            setMsgs((prev) =>
+              prev.concat([
+                {
+                  role: "agent",
+                  text:
+                    "In the 2D demo I scrub the generated exploded sequence. Try: “run it apart”, “back to assembled”, or “explain the sequence”.",
+                  actions: [],
+                },
+              ]),
+            );
+          }
+          return;
+        }
+
+        // ----- 3D mode -----
+        const intents: { match: RegExp; actions: string[]; text: string; run: () => void }[] = [
+          {
+            match: /(come?s? apart|explode|disassemb|take apart|separate|blow.?up)/i,
+            actions: ["reset()", "explode(1.0)"],
+            text:
+              "Separating all eight parts along the assembly axis. Each part holds its functional position in the stack — drag to orbit and read the layout top to bottom.",
+            run: () => {
+              v?.reset();
+              setExplode(1);
+              v?.setExplode(1);
+            },
+          },
+          {
+            match: /(connecting rod|conrod|\brod\b)/i,
+            actions: ["focus(P-05)", "highlight(P-05)"],
+            text:
+              "The connecting rod (P-05) converts the piston’s linear travel into rotation at the crank journal. I’ve focused the camera and highlighted it.",
+            run: () => {
+              v?.clearIsolate();
+              v?.focus("P-05");
+              selectById("P-05");
+            },
+          },
+          {
+            match: /(valve train|valvetrain|isolate the valve|valve)/i,
+            actions: ["explode(0.5)", "isolate([P-07, P-08])"],
+            text:
+              "Isolating the valve train — intake valve (P-07) and its return spring (P-08). Everything else is ghosted so you can read their interface.",
+            run: () => {
+              setExplode(0.5);
+              v?.setExplode(0.5);
+              v?.isolate(["P-07", "P-08"]);
+              selectById("P-07");
+            },
+          },
+          {
+            match: /(wear|fastest|fail|fatigue|friction|stress)/i,
+            actions: ["explode(0.4)", "highlight([P-03, P-04])"],
+            text:
+              "Highest-wear surfaces: the compression ring (P-03) sliding against the bore, and the wrist pin (P-04) under fully reversing load. Both highlighted.",
+            run: () => {
+              v?.clearIsolate();
+              setExplode(0.4);
+              v?.setExplode(0.4);
+              v?.highlight(["P-03", "P-04"]);
+            },
+          },
+          {
+            match: /(reset|reassemble|put.*back|clear|default|collapse)/i,
+            actions: ["reset()"],
+            text: "Reassembled. View, isolation and selection cleared.",
+            run: () => {
+              v?.reset();
+              setExplode(0);
+              setSelected(null);
+            },
+          },
+          {
+            match: /(focus|zoom).*(piston)|piston/i,
+            actions: ["focus(P-02)", "highlight(P-02)"],
+            text:
+              "The piston (P-02) transfers combustion pressure to the rod. Focused and highlighted.",
+            run: () => {
+              v?.clearIsolate();
+              v?.focus("P-02");
+              selectById("P-02");
+            },
+          },
+        ];
+
+        const intent = intents.find((i) => i.match.test(text));
+
+        if (singlePartRef.current && intent && /explode/i.test(intent.actions.join(" "))) {
           setThinking(false);
-          setMsgs((prev: Msg[]) =>
+          setMsgs((prev) =>
             prev.concat([
-              { role: "agent", text: "Please upload an image first so I can analyze it.", actions: [] },
+              {
+                role: "agent",
+                text:
+                  "This asset resolved as a single part, so there’s nothing to explode or isolate. You can still focus and orbit it.",
+                actions: ["explode(0) · no-op"],
+              },
             ]),
           );
           return;
         }
 
-        const res = await askAgent({
-          model_id: currentModelId,
-          message: text,
-          explode_factor: explode,
-        });
-
-        const v = viewerRef.current;
-        const actionLabels: string[] = [];
-
-        for (const action of res.actions) {
-          switch (action.type) {
-            case "explode":
-              actionLabels.push(`explode(${action.factor})`);
-              setExplode(action.factor);
-              v?.setExplode(action.factor);
-              break;
-            case "highlight":
-              actionLabels.push(`highlight(${action.part_id})`);
-              v?.highlight([action.part_id]);
-              selectById(action.part_id);
-              break;
-            case "isolate":
-              actionLabels.push(`isolate([${action.part_ids.join(", ")}])`);
-              if (explode < 0.3) {
-                setExplode(0.5);
-                v?.setExplode(0.5);
-              }
-              v?.isolate(action.part_ids);
-              if (action.part_ids[0]) selectById(action.part_ids[0]);
-              break;
-            case "focus":
-              actionLabels.push(`focus(${action.part_id})`);
-              v?.clearIsolate();
-              v?.focus(action.part_id);
-              selectById(action.part_id);
-              break;
-            case "reset":
-              actionLabels.push("reset()");
-              v?.reset();
-              setExplode(0);
-              setSelected(null);
-              break;
-          }
+        if (intent) {
+          intent.run();
+          setThinking(false);
+          setMsgs((prev) =>
+            prev.concat([{ role: "agent", text: intent.text, actions: intent.actions }]),
+          );
+        } else {
+          setThinking(false);
+          setMsgs((prev) =>
+            prev.concat([
+              {
+                role: "agent",
+                text:
+                  "I’m a scripted demo agent acting on the live model. Try: “show how it comes apart”, “isolate the valve train”, “which parts wear fastest?”, or “focus the piston”.",
+                actions: [],
+              },
+            ]),
+          );
         }
-
-        setThinking(false);
-        setMsgs((prev: Msg[]) =>
-          prev.concat([{ role: "agent", text: res.reply, actions: actionLabels, citations: res.citations || [] }]),
-        );
-      } catch (e) {
-        setThinking(false);
-        setMsgs((prev: Msg[]) =>
-          prev.concat([
-            { role: "agent", text: `Error contacting agent: ${e}`, actions: [] },
-          ]),
-        );
-      }
+      }, 520);
     },
-    [selectById, currentModelId, explode],
+    [selectById, manualUrl],
   );
 
   /* ---- apply a single agent action to the live viewer / frame scrubber ---- */
@@ -283,6 +583,7 @@ export default function Home() {
     (text: string) => {
       setMsgs((prev) => prev.concat([{ role: "user", text }]));
       setDraft("");
+      resetIdle();
 
       // 2D: the agent scrubs the generated sequence (scripted, tailored copy).
       if (modeRef.current === "2d") {
@@ -315,7 +616,7 @@ export default function Home() {
         }
       })();
     },
-    [runScriptedAgent, applyAction, modelName],
+    [runScriptedAgent, applyAction, modelName, resetIdle],
   );
 
   /* ---- voice input: mic → live transcript → composer draft ---- */
@@ -365,7 +666,8 @@ export default function Home() {
     const val = parseFloat(e.target.value);
     setExplode(val);
     if (modeRef.current === "3d") viewerRef.current?.setExplode(val);
-  }, []);
+    resetIdle();
+  }, [resetIdle]);
 
   /* ---- selected-part card (3D only) ---- */
   const focusSel = useCallback(() => {
@@ -396,139 +698,111 @@ export default function Home() {
     }
   }, []);
 
-  /* ---- real generation: calls backend /api/generate, polls /api/jobs/{id} ---- */
-  const startRealGenerate = useCallback(
-    async (file: File) => {
-      setAppState("generating");
-      setProgress(0);
-      setGenStep(GEN_STEPS[0][1]);
-      setMsgs([{ role: "agent", text: "Uploading image to backend...", actions: ["upload()"] }]);
-
-      try {
-        const job = await startGenerate(file);
-        setCurrentJobId(job.job_id);
-
-        const finalJob = await pollJob(job.job_id, (j: Job) => {
-          setProgress(j.progress);
-          let step = GEN_STEPS[0][1];
-          for (const st of GEN_STEPS) if (j.progress >= st[0]) step = st[1];
-          setGenStep(step);
-          if (j.status === "running") {
-            setMsgs((prev: Msg[]) => {
-              const last = prev[prev.length - 1];
-              if (last && last.role === "agent" && last.actions?.[0]?.startsWith("progress")) {
-                return prev;
-              }
-              return prev.concat([{ role: "agent", text: `${step} (${j.progress}%)`, actions: [`progress(${j.progress}%)`] }]);
-            });
-          }
-        });
-
-        if (finalJob.status === "error") {
-          setAppState("error");
-          setErrAssetName(finalJob.error || "Unknown error");
-          setMsgs((prev: Msg[]) =>
-            prev.concat([{ role: "agent", text: `Pipeline error: ${finalJob.error}`, actions: ["error()"] }]),
-          );
-          return;
-        }
-
-        const result = finalJob.result;
-        if (!result) {
-          setAppState("error");
-          setErrAssetName("No result returned");
-          return;
-        }
-
-        setCurrentModelId(result.model_id);
-        const parts = result.parts || [];
-        const single = parts.length <= 1;
-        setSinglePart(single);
-        setPartCount(parts.length);
-        setAllParts(parts);
-
-        // Enriched data
-        setSourceImageUrl(result.source_image_url ? fileUrl(result.source_image_url) : "");
-        setManualUrl(result.manual_url ? fileUrl(result.manual_url) : "");
-        setAllCitations(result.citations || []);
-        setObjectSummary(result.object_summary || "");
-        setObjectType(result.object_type || "");
-        setLikelyModel(result.likely_model || "");
-        setExplodeFrames(result.explode_frames || []);
-        setTurntableFrames(result.turntable_frames || []);
-        setWarnings(result.warnings || []);
-
-        // Load Snaplii actions from job result, or auto-create default
-        const existingActions = result.snaplii_actions || [];
-        if (existingActions.length > 0) {
-          setSnapliiActions(existingActions);
-        } else if (job.job_id) {
-          try {
-            const card = await createSnapliiAction(job.job_id, "manual_card");
-            setSnapliiActions([card]);
-          } catch {
-            // Snaplii optional — silently skip on error
-          }
-        }
-
-        const name = result.likely_model || result.object_type || (parts.length > 0 ? `${parts[0].label} assembly` : "Analyzed object");
-        setModelName(name);
+  /* ---- generation simulation (mode-aware) ---- */
+  const finishGenerate = useCallback(
+    (a: Asset) => {
+      if (modeRef.current === "2d") {
         setAppState("loaded");
+        setModelName(a.name);
+        setActiveAssetId(a.id);
+        setSinglePart(false);
         setExplode(0);
         setSelected(null);
+        // Real wiring: a TwoDResult from /api/jobs carries the Kling V3 video.
+        // setTwoDVideoSrc(fileUrl(result.video_url));  ← swap in when the backend returns it.
+        if (!process.env.NEXT_PUBLIC_SAMPLE_2D_VIDEO) setTwoDVideoSrc(null);
+        setMsgs([
+          {
+            role: "agent",
+            text: `Generated an exploded sequence for ${a.name}. Drag the frame slider — 0% assembled, 100% exploded — or ask me to run it apart.`,
+            actions: ["synthesize() · 48 frames"],
+          },
+        ]);
+        return;
+      }
 
-        const v = viewerRef.current;
-        if (v) {
-          v.setSinglePart(single);
-          v.reset();
-        }
-
-        const citationsCount = result.citations?.length || 0;
-        const intro: Msg = {
-          role: "agent",
-          text: `Analysis complete — ${parts.length} parts identified via Gemini Vision + Google Search grounding (${citationsCount} citations). Ask me about any part, or tell me to explode, isolate, or focus.`,
-          actions: [`analyze() - ${parts.length} parts, ${citationsCount} citations`],
-        };
-        setMsgs([intro]);
-
-        if (!single && v) {
-          setTimeout(() => {
-            const partIds = parts.map((p) => p.part_id);
-            if (partIds[1]) {
-              v.selectPart(partIds[1]);
-              selectById(partIds[1]);
-            }
-          }, 240);
-        }
-      } catch (e) {
-        setAppState("error");
-        setErrAssetName(String(e));
-        setMsgs((prev: Msg[]) =>
-          prev.concat([{ role: "agent", text: `Upload failed: ${e}`, actions: ["error()"] }]),
-        );
+      const single = a.type === "single";
+      const v = viewerRef.current;
+      if (v) {
+        v.setSinglePart(single);
+        v.reset();
+      }
+      const intro: Msg = single
+        ? {
+            role: "agent",
+            text: `Loaded ${a.name}. This source resolved as a single part — explode and isolate are unavailable, but you can focus and orbit it.`,
+            actions: ["reconstruct() · 1 part"],
+          }
+        : {
+            role: "agent",
+            text: `Loaded ${a.name} — 8 parts resolved. Ask me to explode it, isolate a subsystem, or flag wear surfaces.`,
+            actions: ["reconstruct() · 8 parts"],
+          };
+      setAppState("loaded");
+      setModelName(a.name);
+      setActiveAssetId(a.id);
+      setSinglePart(single);
+      setPartCount(single ? 1 : 8);
+      setExplode(0);
+      setSelected(null);
+      setMsgs([intro]);
+      if (!single) {
+        setTimeout(() => {
+          const vv = viewerRef.current;
+          if (vv) {
+            vv.selectPart("P-02");
+            selectById("P-02");
+          }
+        }, 240);
       }
     },
     [selectById],
   );
 
+  const startGenerate = useCallback(
+    (a: Asset) => {
+      if (genTimer.current) clearInterval(genTimer.current);
+      progAccum.current = 0;
+      genAssetRef.current = a;
+      const steps = modeRef.current === "2d" ? GEN_STEPS_2D : GEN_STEPS_3D;
+      setAppState("generating");
+      setProgress(0);
+      setGenStep(steps[0][1]);
+      startSpinner();
+
+      genTimer.current = setInterval(() => {
+        progAccum.current += 3 + Math.random() * 4;
+        const p = progAccum.current;
+
+        if (a.type === "error" && p >= 70) {
+          if (genTimer.current) clearInterval(genTimer.current);
+          stopSpinner();
+          setAppState("error");
+          setErrAssetName(a.name);
+          setProgress(70);
+          return;
+        }
+        if (p >= 100) {
+          if (genTimer.current) clearInterval(genTimer.current);
+          stopSpinner();
+          setProgress(100);
+          finishGenerate(a);
+          return;
+        }
+        let step = steps[0][1];
+        for (const st of steps) if (p >= st[0]) step = st[1];
+        setProgress(p);
+        setGenStep(step);
+      }, 95);
+    },
+    [finishGenerate, startSpinner, stopSpinner],
+  );
+
   /* ---- assets / top-level actions ---- */
+  const toggleAssets = useCallback(() => setDrawerOpen((o) => !o), []);
   const onNew = useCallback(() => {
     setAppState("empty");
-    setCurrentJobId(null);
-    setCurrentModelId(null);
-    setAllParts([]);
-    setAllCitations([]);
-    setSourceImageUrl("");
-    setManualUrl("");
-    setObjectSummary("");
-    setObjectType("");
-    setLikelyModel("");
-    setExplodeFrames([]);
-    setTurntableFrames([]);
-    setWarnings([]);
-    setShowPartsPanel(false);
-    setSnapliiActions([]);
-    setMsgs([INTRO]);
+    setDrawerOpen(false);
   }, []);
   /* ---- real 2D pipeline: upload → /api/generate (mode=2d) → poll → play Kling video ---- */
   const runGenerate2D = useCallback(async (file: File) => {
@@ -537,27 +811,30 @@ export default function Home() {
     setProgress(0);
     setGenStep("Uploading photo…");
     setErrAssetName(file.name);
+    startSpinner();
     try {
       const job = await apiGenerate(file, "2d");
       const final = await pollJob(job.job_id, (j) => {
+        // Sync real progress — the simulated progress takes the max
         const p = j.progress ?? 0;
-        setProgress(p);
-        setGenStep(
-          p < 45
-            ? "Generating part image…"
-            : p < 95
-              ? "Synthesizing exploded frames…"
-              : "Encoding sequence…",
-        );
+        realProgress.current = p;
       });
+      // Jump to 100% on completion for a satisfying finish
+      stopSpinner();
+      setProgress(100);
+      setGenStep("Done");
       if (final.status === "error" || !final.result || final.result.kind !== "2d") {
         setErrAssetName(file.name);
         setAppState("error");
         return;
       }
       const r = final.result;
-      setTwoDVideoSrc(fileUrl(r.video_url));
-      setModelName(file.name.replace(/\.[^.]+$/, ""));
+      setTwoDVideoSrc(r.video_url ? fileUrl(r.video_url) : null);
+      setTwoDFrames(r.explode_frames ?? null);
+      setTwoDSourceImage(r.source_image_url ? fileUrl(r.source_image_url) : null);
+      setManualUrl(r.manual_url ? fileUrl(r.manual_url) : null);
+      setPdfUrl(r.pdf_url ? fileUrl(r.pdf_url) : null);
+      setModelName(r.object_type || file.name.replace(/\.[^.]+$/, ""));
       setActiveAssetId("");
       setSinglePart(false);
       setExplode(0);
@@ -566,37 +843,52 @@ export default function Home() {
       setMsgs([
         {
           role: "agent",
-          text: `Generated an exploded-view clip from ${file.name}. Drag the FRAME slider — 0% assembled, 100% exploded.`,
+          text: `Generated an exploded-view clip from ${file.name}. Drag the FRAME slider — 0% assembled, 100% exploded.${r.manual_url ? " You can also view the full visual manual." : ""}`,
           actions: [`kling · ${r.frame_count ?? FRAMES_2D} frames`],
         },
       ]);
+      // Start idle auto-play after a brief delay
+      setTimeout(() => resetIdle(), 100);
     } catch {
+      stopSpinner();
       setErrAssetName(file.name);
       setAppState("error");
     }
-  }, []);
+  }, [startSpinner, stopSpinner, resetIdle]);
 
   const onFile = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
-      if (e.target.files && e.target.files[0]) {
-        startRealGenerate(e.target.files[0]);
-      }
+      const file = e.target.files?.[0];
+      if (!file) return;
+      if (modeRef.current === "2d") runGenerate2D(file);
+      else startGenerate(ASSETS[0]); // 3D backend is a stub → keep the simulation
     },
-    [startRealGenerate],
+    [runGenerate2D, startGenerate],
   );
+  const useSample = useCallback(() => startGenerate(ASSETS[0]), [startGenerate]);
+  const selectAsset = useCallback(
+    (a: Asset) => {
+      setDrawerOpen(false);
+      if (a.id === activeAssetId && appState === "loaded") return;
+      startGenerate(a);
+    },
+    [activeAssetId, appState, startGenerate],
+  );
+  const retry = useCallback(() => {
+    const a = genAssetRef.current;
+    if (a) startGenerate({ ...a, type: "multi" });
+  }, [startGenerate]);
 
   const switchMode = useCallback((m: Mode) => {
     setMode(m);
-    setShowPartsPanel(false);
+    setDrawerOpen(false);
   }, []);
 
   /* ---- derived ---- */
   const is2d = mode === "2d";
-  const isManual = mode === "manual";
-  const is3d = mode === "3d";
   const explodePct = Math.round((explode || 0) * 100);
   const explodeLabel = !is2d && singlePart ? "N/A" : explodePct + "%";
-  const sliderDisabled = appState !== "loaded" || (!is2d && singlePart) || isManual;
+  const sliderDisabled = appState !== "loaded" || (!is2d && singlePart);
 
   const partCountLabel = singlePart ? "1 PART" : partCount + " PARTS";
 
@@ -605,16 +897,14 @@ export default function Home() {
         { label: "Run it apart", text: "Run it apart" },
         { label: "Back to assembled", text: "Back to assembled" },
         { label: "Explain the sequence", text: "Explain the sequence" },
+        ...(manualUrl ? [{ label: "Open the manual", text: "__OPEN_MANUAL__" }] : []),
       ]
     : [
         { label: "Show how it comes apart", text: "Show me how this comes apart" },
-        { label: "What parts are visible?", text: "What parts can you identify?" },
+        { label: "Isolate the valve train", text: "Isolate the valve train" },
         { label: "Which parts wear fastest?", text: "Which parts wear the fastest?" },
         { label: "Reset", text: "Reset the view" },
       ];
-
-  // Use real frames for 2D if available, otherwise fallback to procedural
-  const hasRealFrames = explodeFrames.length > 0 || turntableFrames.length > 0;
 
   return (
     <div className="pl-app">
@@ -630,11 +920,11 @@ export default function Home() {
         <div className="pl-seg" role="tablist" aria-label="Demo mode">
           <button
             role="tab"
-            aria-selected={is3d}
-            className={`pl-seg-btn${is3d ? " active" : ""}`}
+            aria-selected={!is2d}
+            className={`pl-seg-btn${!is2d ? " active" : ""}`}
             onClick={() => switchMode("3d")}
           >
-            <span className="dot" /> 3D
+            <span className="dot" /> 3D Demo
           </button>
           <button
             role="tab"
@@ -642,16 +932,7 @@ export default function Home() {
             className={`pl-seg-btn${is2d ? " active" : ""}`}
             onClick={() => switchMode("2d")}
           >
-            <span className="dot" /> 2D
-          </button>
-          <button
-            role="tab"
-            aria-selected={isManual}
-            className={`pl-seg-btn${isManual ? " active" : ""}`}
-            onClick={() => switchMode("manual")}
-            disabled={appState !== "loaded"}
-          >
-            <span className="dot" /> Manual
+            <span className="dot" /> 2D Demo
           </button>
         </div>
 
@@ -665,7 +946,7 @@ export default function Home() {
 
         <div className="pl-spacer" />
 
-        <div className="pl-explode">
+        <div className="pl-explode" onMouseDown={() => resetIdle()}>
           <span className="lbl">{is2d ? "FRAME" : "EXPLODE"}</span>
           <input
             type="range"
@@ -677,7 +958,39 @@ export default function Home() {
             onChange={onSlider}
           />
           <span className="val">{explodeLabel}</span>
+          {is2d && autoPlaying && (
+            <span className="pl-auto-badge" title="Auto-playing — drag slider to take control">
+              <span className="pl-auto-dot" /> auto
+            </span>
+          )}
         </div>
+
+        {is2d && manualUrl && (
+          <button
+            className="pl-manual-btn"
+            onClick={() => window.open(manualUrl, "_blank")}
+            title="Open the visual manual in a new tab"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+              <path d="M14 2v6h6M16 13H8M16 17H8M10 9H8" />
+            </svg>
+            View Manual
+          </button>
+        )}
+
+        <button
+          className={`pl-assets-btn${drawerOpen ? " active" : ""}`}
+          onClick={toggleAssets}
+        >
+          <span className="glyph">
+            <span />
+            <span />
+            <span />
+            <span />
+          </span>
+          Assets
+        </button>
       </header>
 
       {/* BODY */}
@@ -689,107 +1002,8 @@ export default function Home() {
               <span className="pl-agent-dot" />
               <span className="label">AGENT</span>
             </div>
-            <span className="sub">{is2d ? "scrubs sequence" : isManual ? "viewing manual" : "acts on model"}</span>
+            <span className="sub">{is2d ? "scrubs sequence" : "acts on model"}</span>
           </div>
-
-          {/* Source image thumbnail */}
-          {sourceImageUrl && appState === "loaded" && (
-            <div className="pl-source-img">
-              <img src={sourceImageUrl} alt="Uploaded product" style={{ width: "100%", borderRadius: "6px", display: "block" }} />
-              <div className="pl-source-label">SOURCE IMAGE</div>
-            </div>
-          )}
-
-          {/* Object summary */}
-          {appState === "loaded" && (objectSummary || likelyModel) && (
-            <div className="pl-obj-summary">
-              {likelyModel && <div className="pl-obj-model">{likelyModel}</div>}
-              {objectType && <div className="pl-obj-type">Type: {objectType}</div>}
-              {objectSummary && <div className="pl-obj-desc">{objectSummary}</div>}
-            </div>
-          )}
-
-          {/* Parts breakdown toggle */}
-          {appState === "loaded" && allParts.length > 0 && (
-            <button className="pl-parts-toggle" onClick={() => setShowPartsPanel((s) => !s)}>
-              {showPartsPanel ? "Hide" : "Show"} Parts Breakdown ({allParts.length})
-            </button>
-          )}
-
-          {/* Parts breakdown panel */}
-          {showPartsPanel && allParts.length > 0 && (
-            <div className="pl-parts-panel">
-              {allParts.map((p, i) => (
-                <div className="pl-part-card" key={i}>
-                  <div className="pl-part-id">{p.part_id}</div>
-                  <div className="pl-part-label">{p.label}</div>
-                  {p.description && <div className="pl-part-desc">{p.description}</div>}
-                  {p.confidence !== undefined && (
-                    <div className="pl-part-conf">
-                      Confidence: {Math.round(p.confidence * 100)}% — {p.source_status || "vision_inferred"}
-                    </div>
-                  )}
-                  {p.sources && p.sources.length > 0 && (
-                    <div className="pl-part-sources">
-                      {p.sources.map((s, j) => (
-                        <a key={j} href={s.url} target="_blank" rel="noopener" className="pl-part-source">
-                          {s.title}
-                        </a>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
-
-          {/* Snaplii action cards */}
-          {appState === "loaded" && snapliiActions.length > 0 && (
-            <div className="pl-snaplii">
-              <div className="pl-snaplii-head">NEXT STEPS WITH SNAPLII</div>
-              {snapliiActions.map((action) => (
-                <div className="pl-snaplii-card" key={action.id}>
-                  <div className="pl-snaplii-info">
-                    <div className="pl-snaplii-label">
-                      {action.label}
-                      {action.mock && <span className="pl-snaplii-mock">MOCK</span>}
-                    </div>
-                    <div className="pl-snaplii-status">Status: {action.status}</div>
-                  </div>
-                  <button
-                    className="pl-snaplii-btn"
-                    onClick={async () => {
-                      try {
-                        const a = await getSnapliiAction(currentJobId || "", action.id);
-                        if (a.url) {
-                          window.open(a.url, "_blank");
-                        } else {
-                          alert(`Snaplii action (mock mode)\nID: ${a.id}\nStatus: ${a.status}`);
-                        }
-                      } catch (e) {
-                        alert(`Error: ${e}`);
-                      }
-                    }}
-                  >
-                    Open
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {/* Citations */}
-          {appState === "loaded" && allCitations.length > 0 && (
-            <div className="pl-citations">
-              <div className="pl-citations-head">SOURCES ({allCitations.length})</div>
-              {allCitations.map((c, i) => (
-                <a key={i} href={c.url} target="_blank" rel="noopener" className="pl-citation">
-                  <span className="pl-citation-title">{c.title}</span>
-                  {c.used_for && <span className="pl-citation-used">{c.used_for}</span>}
-                </a>
-              ))}
-            </div>
-          )}
 
           <div className="pl-log" ref={logElRef}>
             {msgs.map((m, i) =>
@@ -805,16 +1019,6 @@ export default function Home() {
                             <span className="pl-action-chip" key={j}>
                               {act}
                             </span>
-                          ))}
-                        </div>
-                      )}
-                      {m.citations && m.citations.length > 0 && (
-                        <div className="pl-msg-citations">
-                          <small>Sources:</small>
-                          {m.citations.map((c, j) => (
-                            <a key={j} href={c.url} target="_blank" rel="noopener" className="pl-msg-citation">
-                              {c.title}
-                            </a>
                           ))}
                         </div>
                       )}
@@ -843,7 +1047,13 @@ export default function Home() {
                 <button
                   className="pl-suggest"
                   key={i}
-                  onClick={() => handleUserText(s.text)}
+                  onClick={() => {
+                    if (s.text === "__OPEN_MANUAL__" && manualUrl) {
+                      window.open(manualUrl, "_blank");
+                    } else {
+                      handleUserText(s.text);
+                    }
+                  }}
                 >
                   {s.label}
                 </button>
@@ -857,10 +1067,8 @@ export default function Home() {
                 onKeyDown={onKey}
                 placeholder={
                   is2d
-                    ? "Scrub the sequence, or ask me to run it apart..."
-                    : isManual
-                    ? "Ask about the manual..."
-                    : "Ask about a part, or tell me to isolate / focus / explode..."
+                    ? "Scrub the sequence, or ask me to run it apart…"
+                    : "Ask about a part, or tell me to isolate / focus / explode…"
                 }
               />
               {speech.supported && (
@@ -905,7 +1113,7 @@ export default function Home() {
           </div>
         </aside>
 
-        {/* CENTER: STAGE (hosts 3D, 2D, or Manual) */}
+        {/* CENTER: STAGE (hosts both 3D and 2D; only the active one is shown) */}
         <main className="pl-stage">
           <div className="pl-grid" />
           <div className="pl-glow" />
@@ -915,8 +1123,8 @@ export default function Home() {
             <div className="h" />
           </div>
 
-          {/* 3D content - kept mounted so the WebGL context survives tab switches */}
-          <div style={{ position: "absolute", inset: 0, display: is3d ? undefined : "none" }}>
+          {/* 3D content — kept mounted so the WebGL context survives tab switches */}
+          <div style={{ position: "absolute", inset: 0, display: is2d ? "none" : undefined }}>
             <div className="pl-mount" ref={stageElRef} />
 
             <div className="pl-hud">
@@ -969,48 +1177,14 @@ export default function Home() {
 
           {/* 2D content */}
           <div style={{ position: "absolute", inset: 0, display: is2d ? undefined : "none" }}>
-            {hasRealFrames ? (
-              <div className="pl-2d-real">
-                {(() => {
-                  const frames = explodeFrames.length > 0 ? explodeFrames : turntableFrames;
-                  const idx = Math.min(Math.floor(explode * frames.length), frames.length - 1);
-                  const currentFrame = frames[idx];
-                  return (
-                    <>
-                      <img
-                        src={currentFrame.startsWith("http") ? currentFrame : fileUrl(currentFrame)}
-                        alt={`Frame ${idx + 1}`}
-                        style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", borderRadius: "8px" }}
-                      />
-                      <div className="pl-2d-frame-info">
-                        Frame {idx + 1} / {frames.length}
-                        {explodeFrames.length > 0 ? " (Exploded)" : " (Turntable)"}
-                      </div>
-                    </>
-                  );
-                })()}
-              </div>
-            ) : (
-              <TwoDStage factor={explode} active={is2d} frameCount={FRAMES_2D} />
-            )}
-          </div>
-
-          {/* Manual content - iframe with backend HTML manual */}
-          <div style={{ position: "absolute", inset: 0, display: isManual ? undefined : "none" }}>
-            {manualUrl ? (
-              <iframe
-                src={manualUrl}
-                title="Visual Manual"
-                style={{ width: "100%", height: "100%", border: "none", borderRadius: "8px", background: "#0f1117" }}
-              />
-            ) : (
-              <div className="pl-overlay">
-                <div className="pl-gen-wrap">
-                  <div className="pl-gen-label">NO MANUAL</div>
-                  <div className="pl-gen-step">Manual not available. Upload an image first.</div>
-                </div>
-              </div>
-            )}
+            <TwoDStage
+              factor={explode}
+              active={is2d}
+              frameCount={FRAMES_2D}
+              videoSrc={twoDVideoSrc ?? undefined}
+              frames={twoDFrames ?? undefined}
+              sourceImageUrl={twoDSourceImage ?? undefined}
+            />
           </div>
 
           {/* ===== SHARED STATE OVERLAYS ===== */}
@@ -1030,12 +1204,18 @@ export default function Home() {
                     JPG / PNG &middot; single clear object
                     <br />
                     {is2d
-                      ? "Gemini Vision + Google Search grounding"
-                      : isManual
-                      ? "Upload to generate a visual manual"
-                      : "Gemini Vision analyzes & identifies parts"}
+                      ? "Parallax generates multi-angle shots & an exploded sequence"
+                      : "Parallax segments & reconstructs the parts"}
                   </div>
                 </label>
+                <div className="pl-cta-row">
+                  <button className="pl-cta" onClick={useSample}>
+                    {is2d ? "Use sample part" : "Use sample assembly"}
+                  </button>
+                  <button className="pl-cta-ghost" onClick={toggleAssets}>
+                    Browse assets
+                  </button>
+                </div>
               </div>
             </div>
           )}
@@ -1044,8 +1224,12 @@ export default function Home() {
             <div className="pl-overlay gen">
               <div className="pl-scan" />
               <div className="pl-gen-wrap">
+                <div className="pl-gen-spinner-row">
+                  <span className="pl-gen-icon" key={spinnerChar}>{spinnerChar}</span>
+                  <span className="pl-gen-verb" key={spinnerVerb}>{spinnerVerb}…</span>
+                </div>
                 <div className="pl-gen-label">
-                  {is2d ? "SYNTHESIZING" : isManual ? "BUILDING" : "ANALYZING"}
+                  {is2d ? "SYNTHESIZING" : "RECONSTRUCTING"}
                 </div>
                 <div className="pl-gen-num">
                   <span className="n">{Math.round(progress)}</span>
@@ -1063,20 +1247,94 @@ export default function Home() {
             <div className="pl-overlay err">
               <div className="pl-err-wrap">
                 <div className="pl-err-icon">!</div>
-                <div className="pl-err-title">Analysis failed</div>
-                <div className="pl-err-code">ERR_PIPELINE</div>
+                <div className="pl-err-title">
+                  {is2d ? "Generation failed" : "Reconstruction failed"}
+                </div>
+                <div className="pl-err-code">ERR_GEOMETRY_UNRESOLVED</div>
                 <div className="pl-err-detail">
-                  {errAssetName}
+                  Could not segment a clean part boundary from
+                  <br />
+                  {errAssetName}. Try a sharper, less occluded photo.
                 </div>
                 <div className="pl-cta-row">
-                  <button className="pl-cta" onClick={onNew}>
-                    Try again
+                  <button className="pl-cta" onClick={retry}>
+                    Retry
+                  </button>
+                  <button className="pl-cta-ghost" onClick={onNew}>
+                    Choose another
                   </button>
                 </div>
               </div>
             </div>
           )}
         </main>
+
+        {/* ASSETS DRAWER (overlay) */}
+        <div
+          className="pl-drawer"
+          style={{ transform: `translateX(${drawerOpen ? "0" : "-340px"})` }}
+        >
+          <div className="pl-drawer-head">
+            <div className="left">
+              <span className="label">ASSETS</span>
+              <span className="count">{ASSETS.length} resolved</span>
+            </div>
+            <button
+              className="pl-drawer-close"
+              onClick={toggleAssets}
+              aria-label="Close assets"
+            >
+              ×
+            </button>
+          </div>
+          <div className="pl-drawer-grid">
+            {ASSETS.map((a) => {
+              const active = a.id === activeAssetId && appState === "loaded";
+              const isErr = a.type === "error";
+              const tagColor = isErr
+                ? "#c87268"
+                : a.type === "single"
+                  ? "#d8a04a"
+                  : "var(--txt2)";
+              const tagBorder = isErr
+                ? "rgba(200,114,104,.4)"
+                : a.type === "single"
+                  ? "rgba(216,160,74,.4)"
+                  : "var(--line)";
+              return (
+                <button
+                  className="pl-asset"
+                  key={a.id}
+                  onClick={() => selectAsset(a)}
+                  style={{ borderColor: active ? ACCENT : "var(--line)" }}
+                >
+                  <div className="pl-asset-thumb">
+                    <div
+                      className="diamond"
+                      style={{ borderColor: active ? ACCENT : "rgba(255,255,255,.22)" }}
+                    />
+                    {active && <span className="pl-asset-active-dot" />}
+                  </div>
+                  <div className="pl-asset-meta">
+                    <div className="pl-asset-id">{a.id}</div>
+                    <div className="pl-asset-name">{a.name}</div>
+                    <span
+                      className="pl-asset-tag"
+                      style={{ color: tagColor, border: `1px solid ${tagBorder}` }}
+                    >
+                      {a.tag}
+                    </span>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+          <div className="pl-drawer-foot">
+            <button className="pl-drawer-new" onClick={onNew}>
+              <span className="plus">+</span> Upload new photo
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   );

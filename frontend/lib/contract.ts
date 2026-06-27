@@ -143,4 +143,18 @@ export interface TwoDResult {
   frame_count?: number;
   /** Optional: the multi-angle input shot URLs. */
   angles?: string[];
+  /** Optional: frame data URIs when video generation is blocked (fallback). */
+  explode_frames?: string[];
+  /** Optional: the object label (e.g. "inkjet_printer"). */
+  object_type?: string;
+  /** Optional: the likely model name. */
+  likely_model?: string;
+  /** Optional: URL to the generated visual manual (HTML). */
+  manual_url?: string;
+  /** Optional: URL to the generated visual manual (PDF). */
+  pdf_url?: string;
+  /** Optional: assembled manual steps from Gemini research. */
+  steps?: ManualStep[];
+  /** Optional: short summary of the identified object. */
+  object_summary?: string;
 }

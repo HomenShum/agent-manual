@@ -92,6 +92,8 @@ export default function TwoDStage({
   active,
   frameCount = 48,
   videoSrc,
+  frames,
+  sourceImageUrl,
 }: {
   factor: number;
   active: boolean;
@@ -99,10 +101,15 @@ export default function TwoDStage({
   /** Real exploded-view video (Kling V3 output). When set, the slider scrubs
    *  it via currentTime; otherwise the procedural canvas placeholder renders. */
   videoSrc?: string;
+  /** Array of frame data URIs (from backend fallback or extracted video frames). */
+  frames?: string[];
+  /** The original source image URL — shown as a small inset when no video. */
+  sourceImageUrl?: string;
 }) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const imgRef = useRef<HTMLImageElement | null>(null);
   const durationRef = useRef(0);
   const layoutRef = useRef(buildLayout());
   const factorRef = useRef(factor);
@@ -149,9 +156,84 @@ export default function TwoDStage({
     }
   }, [factor, videoSrc]);
 
-  // ---- placeholder path: procedural canvas diagram (no video yet) ----
+  // ---- frame-image path: draw the frame at the current factor ----
   useEffect(() => {
-    if (videoSrc) return;
+    if (videoSrc || !frames || frames.length === 0) return;
+    const canvas = canvasRef.current;
+    const wrap = wrapRef.current;
+    if (!canvas || !wrap) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const img = new Image();
+    img.onload = () => {
+      imgRef.current = img;
+      drawFrame();
+    };
+    img.src = frames[0];
+
+    const drawFrame = () => {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const cw = wrap.clientWidth;
+      const ch = wrap.clientHeight;
+      if (!cw || !ch) return;
+      if (canvas.width !== cw * dpr || canvas.height !== ch * dpr) {
+        canvas.width = cw * dpr;
+        canvas.height = ch * dpr;
+      }
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, cw, ch);
+
+      const f = Math.max(0, Math.min(1, factorRef.current));
+      const idx = Math.round(f * (frames.length - 1));
+      const curImg = imgRef.current;
+      if (!curImg) return;
+
+      // Draw the current frame, fit to canvas
+      const imgRatio = curImg.width / curImg.height;
+      const canvasRatio = cw / ch;
+      let dw, dh, dx, dy;
+      if (imgRatio > canvasRatio) {
+        dw = cw * 0.9;
+        dh = dw / imgRatio;
+        dx = (cw - dw) / 2;
+        dy = (ch - dh) / 2;
+      } else {
+        dh = ch * 0.9;
+        dw = dh * imgRatio;
+        dx = (cw - dw) / 2;
+        dy = (ch - dh) / 2;
+      }
+      ctx.drawImage(curImg, dx, dy, dw, dh);
+    };
+
+    // Load the correct frame when factor changes
+    const updateFrame = () => {
+      const f = Math.max(0, Math.min(1, factorRef.current));
+      const idx = Math.round(f * (frames.length - 1));
+      if (idx >= 0 && idx < frames.length) {
+        const newImg = new Image();
+        newImg.onload = () => {
+          imgRef.current = newImg;
+          drawFrame();
+        };
+        newImg.src = frames[idx];
+      }
+    };
+
+    const interval = setInterval(updateFrame, 100);
+    const ro = new ResizeObserver(drawFrame);
+    ro.observe(wrap);
+
+    return () => {
+      clearInterval(interval);
+      ro.disconnect();
+    };
+  }, [videoSrc, frames]);
+
+  // ---- placeholder path: procedural canvas diagram (no video, no frames) ----
+  useEffect(() => {
+    if (videoSrc || (frames && frames.length > 0)) return;
     const canvas = canvasRef.current;
     const wrap = wrapRef.current;
     if (!canvas || !wrap) return;
@@ -292,6 +374,14 @@ export default function TwoDStage({
         <canvas className="pl2-canvas" ref={canvasRef} />
       )}
 
+      {/* source image inset — shown when no video, in bottom-left */}
+      {!videoSrc && sourceImageUrl && (
+        <div className="pl2-src-inset">
+          <img src={sourceImageUrl} alt="Source" />
+          <span>SOURCE</span>
+        </div>
+      )}
+
       {/* top-left HUD */}
       <div className="pl-hud">
         <div className="pl-hud-name">Exploded Sequence</div>
@@ -300,7 +390,7 @@ export default function TwoDStage({
           <span className="pl-axis">2D · FRAME-SCRUB</span>
         </div>
         <div className="pl-hud-help">
-          DRAG&nbsp;FRAME&nbsp;SLIDER
+          DRAG&nbsp;SLIDER&nbsp;OR&nbsp;LET&nbsp;IT&nbsp;LOOP
           <br />
           0%&nbsp;ASSEMBLED&nbsp;&middot;&nbsp;100%&nbsp;EXPLODED
         </div>
